@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Tag name'
+        description: 'Tag Name'
         required: true
         default: '1.8.0'
       upload_releases:
@@ -29,7 +29,7 @@ jobs:
       contents: write
     strategy:
       fail-fast: false
-      max-parallel: 4   
+      max-parallel: 4
       matrix:
         device: [a51]
         variant: ['', --oneui]
@@ -40,41 +40,89 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Fetch all history for all tags and branches
+          fetch-depth: 0
 
       - name: apt update
         run: |
           sudo apt -y update
           sudo apt -y install bison flex libssl-dev python3 python-is-python3
-          
+
       - name: Download clang
         run: |
           wget https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz -O "weebx-clang.tar.gz"
           rm -rf toolchain && mkdir toolchain && tar -xvf weebx-clang.tar.gz -C toolchain && rm -rf weebx-clang.tar.gz
 
-      - name: Initialize KernelSU Next
+      - name: Initialize KernelSU
         if: matrix.ksu != '--no-ksu'
+        shell: bash
         run: |
-          curl -LSs "https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh" | bash -s 
+          set -euo pipefail
+          curl -LSsf \
+            https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh \
+            | bash -s
           python3 KernelSU/scripts/integrate-no-kprobe.py --no-defconfig-flag
-          curl -LSs "https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh" | bash -s -- --cleanup
-          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next-susfs-4.14
-          
+          curl -LSsf \
+            https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh \
+            | bash -s -- --cleanup
+
+      - name: Clean generated integration state
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx
+
       - name: Build Kernel
-        uses: Wandalen/wretry.action@master
-        with:
-          attempt_limit: 3
-          attempt_delay: 10
-          command: python build_kernel.py ${{ matrix.variant }} --target=${{ matrix.device }} ${{ matrix.ksu }}
+        id: build_kernel
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p build_logs
+          for attempt in 1 2 3; do
+            echo "=== Attempt $attempt ===" | tee -a build_logs/build_attempt.log
+            python3 build_kernel.py ${{ matrix.variant }} --target=${{ matrix.device }} ${{ matrix.ksu }} 2>&1 | tee -a build_logs/build_attempt.log
+            exit_code=${PIPESTATUS[0]}
+            if [ $exit_code -eq 0 ]; then
+              echo "Build succeeded on attempt $attempt" | tee -a build_logs/build_attempt.log
+              exit 0
+            fi
+            echo "Attempt $attempt failed with exit code $exit_code" | tee -a build_logs/build_attempt.log
+            sleep 10
+          done
+          exit 1
+
+      - name: Collect all logs
+        if: always()
+        run: |
+          mkdir -p all_logs
+          find . -type f \( -name '*.log' -o -name '*err*' -o -name '*out*' \) -not -path './.git/*' -exec cp --parents {} all_logs/ \; 2>/dev/null || true
+          cp -r build_logs all_logs/ 2>/dev/null || true
+          echo "=== Collected log files ==="
+          find all_logs -type f | head -50
 
       - name: Print Logs
-        if: failure()
+        if: always()
         run: |
-          find . -type f -name '*err.log' -exec cat {} \;
-          
+          echo "=== Build attempt log ==="
+          cat build_logs/build_attempt.log 2>/dev/null || echo "No build attempt log found"
+          echo ""
+          echo "=== Error logs ==="
+          find . -type f -name '*err.log' -exec sh -c 'echo "--- {} ---"; cat "{}"' \; 2>/dev/null || echo "No err.log files"
+          echo ""
+          echo "=== Out logs ==="
+          find . -type f -name '*out.log' -exec sh -c 'echo "--- {} ---"; cat "{}"' \; 2>/dev/null || echo "No out.log files"
+
+      - name: Upload build logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ matrix.device }}-${{ matrix.variant }}-${{ matrix.ksu }}
+          path: |
+            all_logs/
+            build_logs/
+          retention-days: 30
+
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
-        if: inputs.upload_releases == true
+        if: inputs.upload_releases == true && steps.build_kernel.outcome == 'success'
         with:
           files: |
             *SN*.zip
