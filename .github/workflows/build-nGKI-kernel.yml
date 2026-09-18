@@ -47,19 +47,16 @@ jobs:
           rm -f weebx-clang.tar.gz
           ls -la toolchain | head -n 20
 
-      - name: Verify toolchain is in place
+      - name: Verify toolchain
         working-directory: kernel_source
         run: |
-          test -d "toolchain" || { echo "::error::toolchain missing"; exit 1; }
           test -x "toolchain/bin/clang" || { echo "::error::clang missing"; exit 1; }
           ./toolchain/bin/clang --version
 
       # ============================================================
-      # KernelSU-Next + SuSFS (dev-susfs fork)
-      # ملاحظة: susfs.c/susfs.h هما ملفات كيرنل، مو KernelSU
-      # فنتحقق من وجود kernel/Makefile و kernel/Kconfig فقط
+      # 1) KernelSU-Next + SuSFS hooks (dev-susfs fork)
       # ============================================================
-      - name: Setup KernelSU-Next with SuSFS (dev-susfs)
+      - name: Setup KernelSU-Next (dev-susfs)
         working-directory: kernel_source
         run: |
           set -e
@@ -67,40 +64,96 @@ jobs:
 
           BRANCH=""
           for candidate in dev-susfs next-susfs; do
-            echo "::group::Trying branch: $candidate"
             if git clone --depth=1 -b "$candidate" \
                  https://github.com/KimelaZPrjkt/KernelSU-Next-susfs.git KernelSU-Next 2>/dev/null; then
               if [ -f "KernelSU-Next/kernel/Makefile" ] && [ -f "KernelSU-Next/kernel/Kconfig" ]; then
-                BRANCH="$candidate"
-                echo "✅ Branch $candidate OK"
-                echo "::endgroup::"
-                break
+                BRANCH="$candidate"; break
               fi
             fi
             rm -rf KernelSU-Next
-            echo "::endgroup::"
           done
-
-          if [ -z "$BRANCH" ]; then
-            echo "::error::No usable branch found (tried dev-susfs, next-susfs)"
-            exit 1
-          fi
+          test -n "$BRANCH" || { echo "::error::no usable branch"; exit 1; }
           echo "Using branch: $BRANCH"
 
           ln -sf KernelSU-Next KernelSU
+          echo "kernel/ listing:"
+          ls -la KernelSU-Next/kernel/ | head -n 40
 
-          echo "kernel/ contents:"
-          ls -la KernelSU-Next/kernel/ | head -n 30
+      # ============================================================
+      # 2) SuSFS kernel-side patches (simonpunk/susfs4ksu, kernel-4.14)
+      # ============================================================
+      - name: Fetch simonpunk/susfs4ksu (kernel-4.14)
+        working-directory: kernel_source
+        run: |
+          set -e
+          rm -rf susfs4ksu
+          git clone --depth=1 -b kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
 
-          echo "SusFS-related Kconfig entries:"
-          grep -iE "susfs|SUSFS" KernelSU-Next/kernel/Kconfig || echo "(no susfs entries in Kconfig — expected on some forks)"
+          echo "susfs4ksu/kernel_patches contents:"
+          ls -la susfs4ksu/kernel_patches/ || true
+          echo "fs/ folder:"
+          ls -la susfs4ksu/kernel_patches/fs/ || true
+          echo "include/linux/ folder:"
+          ls -la susfs4ksu/kernel_patches/include/linux/ || true
+          echo "KernelSU patch:"
+          ls -la susfs4ksu/kernel_patches/KernelSU/ || true
 
-          echo "SusFS-related sources inside KernelSU-Next/kernel (if any):"
-          find KernelSU-Next -iname "*susfs*" -maxdepth 4 || true
+      - name: Copy SuSFS files into kernel tree
+        working-directory: kernel_source
+        run: |
+          set -e
+          SRC="susfs4ksu/kernel_patches"
 
-          echo "✅ KernelSU-Next ready (branch: $BRANCH)"
+          # ملفات الكيرنل الرئيسية
+          cp "$SRC/fs/susfs.c" fs/susfs.c
+          cp "$SRC/include/linux/susfs.h" include/linux/susfs.h
 
-      - name: Hook KernelSU into kernel build system
+          # نسخ إضافية احتياطية لو موجودة
+          [ -f "$SRC/include/linux/susfs_def.h" ] && cp "$SRC/include/linux/susfs_def.h" include/linux/susfs_def.h || true
+          [ -d "$SRC/fs" ] && find "$SRC/fs" -type f -exec cp {} fs/ \; || true
+
+          echo "✅ SuSFS kernel files copied:"
+          ls -la fs/susfs.c include/linux/susfs.h
+
+      - name: Apply KernelSu-side SuSFS patch (if any)
+        working-directory: kernel_source
+        run: |
+          set +e
+          P="$PWD/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          if [ -f "$P" ]; then
+            cd KernelSU-Next
+            patch -p1 --forward < "$P" && echo "✅ KernelSU patch applied" || echo "::warning::KernelSU patch had rejects (check .rej)"
+            cd ..
+          else
+            echo "ℹ️ No KernelSU-side patch found, skipping"
+          fi
+
+      - name: Apply SuSFS kernel patch (4.14)
+        working-directory: kernel_source
+        run: |
+          set +e
+          P="$PWD/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch"
+          if [ -f "$P" ]; then
+            patch -p1 --forward < "$P"
+            RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "::warning::Kernel patch had some rejects — see .rej files"
+              find . -name "*.rej" -not -path "./susfs4ksu/*" | head -n 20
+            else
+              echo "✅ Kernel SuSFS patch applied cleanly"
+            fi
+          else
+            echo "::error::50_add_susfs_in_kernel-4.14.patch not found"
+            exit 1
+          fi
+
+          # تحقق نهائي
+          test -f fs/susfs.c || { echo "::error::fs/susfs.c missing after patch"; exit 1; }
+          test -f include/linux/susfs.h || { echo "::error::include/linux/susfs.h missing after patch"; exit 1; }
+          echo "✅ SuSFS files in place"
+
+      - name: Hook KernelSU into build system
         working-directory: kernel_source
         run: |
           set -e
@@ -108,16 +161,27 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += KernelSU/kernel/' >> Makefile
           fi
 
+          # نضيف مصادر SuSFS في fs/Makefile (patches عادة تسويها، بس نتأكد)
+          if ! grep -q "susfs" fs/Makefile; then
+            echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+          fi
+
           KCONFIG_MAIN=""
-          for candidate in Kconfig Kconfig.ext; do
-            if [ -f "$candidate" ]; then KCONFIG_MAIN="$candidate"; break; fi
+          for c in Kconfig Kconfig.ext; do
+            [ -f "$c" ] && { KCONFIG_MAIN="$c"; break; }
           done
-          test -n "$KCONFIG_MAIN" || { echo "::error::no Kconfig root"; exit 1; }
+          test -n "$KCONFIG_MAIN" || { echo "::error::no root Kconfig"; exit 1; }
 
           if ! grep -q "KernelSU" "$KCONFIG_MAIN"; then
             printf '\nsource "KernelSU/kernel/Kconfig"\n' >> "$KCONFIG_MAIN"
           fi
-          echo "✅ Hooked into $KCONFIG_MAIN"
+
+          # نضيف Kconfig لـ SuSFS في fs/Kconfig
+          if [ -f fs/Kconfig ] && ! grep -q "SUSFS" fs/Kconfig; then
+            printf '\nsource "fs/susfs/Kconfig"\n' >> fs/Kconfig 2>/dev/null || true
+          fi
+
+          echo "✅ Build system hooked"
 
       - name: Enable KernelSU + SuSFS in defconfig
         working-directory: kernel_source
@@ -127,49 +191,55 @@ jobs:
           if [ -z "$DEFCONFIG" ]; then
             DEFCONFIG=$(find arch/arm64/configs vendor -maxdepth 3 \( -name "*exynos9611*" -o -name "*universal9611*" \) 2>/dev/null | head -n1)
           fi
-          if [ -z "$DEFCONFIG" ]; then
-            echo "::error::Could not locate A51/Exynos9611 defconfig"
-            find arch/arm64/configs -name "*defconfig" | head -n 20
-            exit 1
-          fi
+          test -n "$DEFCONFIG" || { echo "::error::no defconfig"; exit 1; }
           echo "Using defconfig: $DEFCONFIG"
 
-          sed -i '/^CONFIG_KSU=/d' "$DEFCONFIG"
-          sed -i '/^# CONFIG_KSU is not set/d' "$DEFCONFIG"
-          sed -i '/^CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
-          sed -i '/^# CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
+          sed -i '/^CONFIG_KSU=/d; /^# CONFIG_KSU is not set/d' "$DEFCONFIG"
+          sed -i '/^CONFIG_KSU_SUSFS/d; /^# CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
 
-          {
-            echo ""
-            echo "# KernelSU-Next"
-            echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_SUSFS=y"
-            echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
-          } >> "$DEFCONFIG"
+          cat >> "$DEFCONFIG" <<'EOF'
 
-          echo "✅ defconfig updated"
+# KernelSU + SuSFS
+CONFIG_KSU=y
+CONFIG_KSU_SUSFS=y
+# CONFIG_KSU_SUSFS_SUS_SU is not set
+EOF
+
+          echo "=== KernelSU/SuSFS lines in defconfig ==="
+          grep -iE "ksu|susfs" "$DEFCONFIG"
 
       - name: Build kernel (target=a51)
         working-directory: kernel_source
         run: |
           python3 build_kernel.py --target=a51 --allow-dirty
 
-      - name: Verify SuSFS symbols in output
+      - name: Post-build verification
         if: success()
         working-directory: kernel_source
         run: |
           set +e
+          echo "=== .config SuSFS entries ==="
+          find out -name ".config" -exec grep -iE "KSU|SUSFS" {} \; | sort -u || true
+
+          echo ""
+          echo "=== susfs.o in build tree ==="
+          find out -name "susfs.o" 2>/dev/null || echo "(susfs.o not found — check Kbuild)"
+          find out -name "susfs.*" 2>/dev/null | head -n 20
+
+          echo ""
+          echo "=== Symbols in Image ==="
           IMG=$(find . -maxdepth 6 \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" \) 2>/dev/null | head -n1)
-          if [ -z "$IMG" ]; then
-            echo "::warning::No kernel Image found"
-            exit 0
+          echo "Image: $IMG"
+          if [ -n "$IMG" ]; then
+            echo "---- susfs symbols ----"
+            strings "$IMG" | grep -i susfs | head -n 30 || echo "(none)"
+            echo "---- ksu symbols ----"
+            strings "$IMG" | grep -i "kernelsu\|ksu_" | head -n 10 || echo "(none)"
           fi
-          echo "Inspecting: $IMG"
-          if strings "$IMG" | grep -qi susfs; then
-            echo "✅ SuSFS symbols detected"
-          else
-            echo "::warning::No SuSFS strings — SuSFS may not be active"
-          fi
+
+          echo ""
+          echo "=== .rej files remaining ==="
+          find . -name "*.rej" -not -path "./susfs4ksu/*" -not -path "./toolchain/*" | head -n 30 || true
 
       - name: Locate built artifacts
         if: always()
@@ -177,7 +247,7 @@ jobs:
         run: |
           find . -maxdepth 6 \( -name "*.zip" -o -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" -o -name "boot.img" \) -print 2>/dev/null || true
 
-      - name: Upload kernel zip(s)
+      - name: Upload kernel zip
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -197,4 +267,5 @@ jobs:
           path: |
             kernel_source/*.log
             kernel_source/out/**/*.log
+            kernel_source/**/*.rej
           if-no-files-found: ignore
