@@ -1,108 +1,48 @@
-name: Build nGKI Kernel with KSU & SuSFS
+name: Build A51 Kernel with KernelSU Next + SuSFS
 
 on:
   workflow_dispatch:
-    inputs:
-      device_codename:
-        description: 'Device codename (e.g., a51)'
-        required: true
-        default: 'a51'
-      kernel_source:
-        description: 'Kernel source repository URL'
-        required: true
-        default: 'https://github.com/Exynos9611Development/android_kernel_samsung_universal9611.git'
-      kernel_branch:
-        description: 'Kernel source branch'
-        required: true
-        default: 'topser_cat_SN_A15'
-      defconfig_name:
-        description: 'Defconfig file name (e.g., exynos9611-a51_defconfig)'
-        required: true
-        default: 'exynos9611-a51_defconfig'
-      susfs_enable:
-        description: 'Enable SuSFS (true/false)'
-        required: true
-        default: 'true'
-        type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
-      - name: Checkout nGKI_Kernel_Build source
+      - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          repository: 'JackA1ltman/NonGKI_Kernel_Build_2nd'
-          ref: 'mainline' # أو الفرع المناسب
-          path: 'nGKI_build'
+          repository: 'mlm-studios/kernel_samsung_exynos_9611'
+          ref: 'topser_cat_SN_A15'
+          path: 'kernel_source'
 
       - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install -y bc bison build-essential curl flex git gnupg gperf liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev python3 python-is-python3
+          sudo apt -y update
+          sudo apt -y install bison flex libssl-dev python3 python-is-python3 bc
 
-      - name: Clone Kernel Source
+      - name: Download Clang
         run: |
-          git clone --depth=1 -b ${{ github.event.inputs.kernel_branch }} ${{ github.event.inputs.kernel_source }} kernel_source
+          wget https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz -O "weebx-clang.tar.gz"
+          rm -rf toolchain && mkdir toolchain && tar -xvf weebx-clang.tar.gz -C toolchain && rm -rf weebx-clang.tar.gz
 
-      - name: Setup nGKI Build Environment
+      - name: Initialize KernelSU Next with SuSFS
         run: |
-          cd nGKI_build
-          # نسخ ملف التكوين النموذجي وتعديله
-          cp Profiles/device_rom_template.env Profiles/${{ github.event.inputs.device_codename }}_aosp_a16.env
-          # استخدام sed لتعديل المتغيرات (يجب تعديل هذا الجزء حسب هيكل ملف .env)
-          sed -i "s|DEVICE_CODENAME=.*|DEVICE_CODENAME=${{ github.event.inputs.device_codename }}|" Profiles/${{ github.event.inputs.device_codename }}_aosp_a16.env
-          sed -i "s|KERNEL_SOURCE=.*|KERNEL_SOURCE=${{ github.event.inputs.kernel_source }}|" Profiles/${{ github.event.inputs.device_codename }}_aosp_a16.env
-          sed -i "s|KERNEL_BRANCH=.*|KERNEL_BRANCH=${{ github.event.inputs.kernel_branch }}|" Profiles/${{ github.event.inputs.device_codename }}_aosp_a16.env
-          sed -i "s|DEFCONFIG_NAME=.*|DEFCONFIG_NAME=${{ github.event.inputs.defconfig_name }}|" Profiles/${{ github.event.inputs.device_codename }}_aosp_a16.env
-          sed -i "s|SUSFS_ENABLE=.*|SUSFS_ENABLE=${{ github.event.inputs.susfs_enable }}|" Profiles/${{ github.event.inputs.device_codename }}_aosp_a16.env
-          # قد تحتاج إلى تعديل متغيرات أخرى مثل CLANG_SOURCE, KERNELSU_SOURCE, KERNELSU_BRANCH
+          cd kernel_source
+          # تثبيت KernelSU-Non-GKI أولاً
+          curl -LSs "https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh" | bash -s
+          python3 KernelSU/scripts/integrate-no-kprobe.py --no-defconfig-flag
+          curl -LSs "https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh" | bash -s -- --cleanup
+          # محاولة تطبيق SuSFS لنواة 4.14
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next-susfs || echo "تخطي SuSFS"
 
       - name: Build Kernel
-        id: build_kernel
-        continue-on-error: true
         run: |
-          cd nGKI_build
-          # استبدل هذا الأمر بالأمر الفعلي الذي يستخدمه المشروع
-          # قد يكون شيئًا مثل: bash build.sh ${{ github.event.inputs.device_codename }}_aosp_a16
-          # راجع README أو ملفات المشروع لمعرفة الأمر الدقيق
-          echo "Building kernel for ${{ github.event.inputs.device_codename }}..."
-          # مثال:
-          # ./build_kernel.sh --profile ${{ github.event.inputs.device_codename }}_aosp_a16
+          cd kernel_source
+          python3 build_kernel.py --target=a51 --allow-dirty
 
-      - name: Collect logs on failure
-        if: failure()
-        run: |
-          mkdir -p logs
-          find . -name "*.log" -exec cp {} logs/ \;
-          cat logs/*.log | tail -n 200
-
-      - name: Upload Kernel ZIP
+      - name: Upload kernel
         uses: actions/upload-artifact@v4
-        if: success()
         with:
-          name: kernel-${{ github.event.inputs.device_codename }}-${{ github.run_number }}
-          path: |
-            nGKI_build/out/*.zip
-            nGKI_build/*.zip
-          retention-days: 30
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        if: success() && github.event_name == 'workflow_dispatch'
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: Kernel Build ${{ github.run_number }}
-          files: |
-            nGKI_build/out/*.zip
-            nGKI_build/*.zip
-          body: |
-            Kernel for ${{ github.event.inputs.device_codename }} built with KernelSU Next and SuSFS.
-            - Device: ${{ github.event.inputs.device_codename }}
-            - Kernel Source: ${{ github.event.inputs.kernel_source }}
-            - Branch: ${{ github.event.inputs.kernel_branch }}
-            - SuSFS Enabled: ${{ github.event.inputs.susfs_enable }}
-          prerelease: false
+          name: kernel-${{ github.run_number }}
+          path: kernel_source/*.zip
