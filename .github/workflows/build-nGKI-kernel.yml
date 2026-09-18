@@ -45,97 +45,86 @@ jobs:
           mkdir -p toolchain
           tar -xf weebx-clang.tar.gz -C toolchain
           rm -f weebx-clang.tar.gz
-          echo "Toolchain contents:"
           ls -la toolchain | head -n 20
 
       - name: Verify toolchain is in place
         working-directory: kernel_source
         run: |
-          if [ ! -d "toolchain" ]; then
-            echo "::error::toolchain directory missing inside kernel_source"
-            exit 1
-          fi
-          if [ ! -x "toolchain/bin/clang" ]; then
-            echo "::error::toolchain/bin/clang not found or not executable"
-            ls -la toolchain
-            exit 1
-          fi
+          test -d "toolchain" || { echo "::error::toolchain missing"; exit 1; }
+          test -x "toolchain/bin/clang" || { echo "::error::clang missing"; exit 1; }
           ./toolchain/bin/clang --version
 
       # ============================================================
-      # KernelSU-Next + SuSFS مدمج (dev-susfs fork) - لا يحتاج patches يدوية
+      # KernelSU-Next + SuSFS (dev-susfs fork)
+      # ملاحظة: susfs.c/susfs.h هما ملفات كيرنل، مو KernelSU
+      # فنتحقق من وجود kernel/Makefile و kernel/Kconfig فقط
       # ============================================================
       - name: Setup KernelSU-Next with SuSFS (dev-susfs)
         working-directory: kernel_source
         run: |
           set -e
-          # احذف أي KernelSU قديم عشان ما يصير تعارض
           rm -rf KernelSU KernelSU-Next
 
-          # استنسخ الفورك اللي فيه SuSFS مدمج أصلاً
-          git clone --depth=1 -b dev-susfs \
-            https://github.com/KimelaZPrjkt/KernelSU-Next-susfs.git KernelSU-Next
+          BRANCH=""
+          for candidate in dev-susfs next-susfs; do
+            echo "::group::Trying branch: $candidate"
+            if git clone --depth=1 -b "$candidate" \
+                 https://github.com/KimelaZPrjkt/KernelSU-Next-susfs.git KernelSU-Next 2>/dev/null; then
+              if [ -f "KernelSU-Next/kernel/Makefile" ] && [ -f "KernelSU-Next/kernel/Kconfig" ]; then
+                BRANCH="$candidate"
+                echo "✅ Branch $candidate OK"
+                echo "::endgroup::"
+                break
+              fi
+            fi
+            rm -rf KernelSU-Next
+            echo "::endgroup::"
+          done
 
-          # SuSFS مخزّن داخل KernelSU-Next، والمجلد اللي الكيرنل يدوّر عليه اسمه KernelSU
-          ln -sf KernelSU-Next KernelSU
-
-          # اربطه بالـ Makefile و Kconfig
-          KSU_MAKEFILE="KernelSU-Next/kernel/Makefile"
-          KSU_KCONFIG="KernelSU-Next/kernel/Kconfig"
-          if [ ! -f "$KSU_MAKEFILE" ]; then
-            echo "::error::KernelSU-Next kernel/Makefile not found — wrong branch?"
-            ls -la KernelSU-Next
+          if [ -z "$BRANCH" ]; then
+            echo "::error::No usable branch found (tried dev-susfs, next-susfs)"
             exit 1
           fi
+          echo "Using branch: $BRANCH"
 
-          # تأكد إن الملفات الرئيسية لـ SuSFS موجودة
-          test -f KernelSU-Next/kernel/susfs.c || {
-            echo "::error::susfs.c not found — dev-susfs branch missing SuSFS?"
-            exit 1
-          }
-          test -f KernelSU-Next/kernel/susfs.h || {
-            echo "::error::susfs.h not found"
-            exit 1
-          }
+          ln -sf KernelSU-Next KernelSU
 
-          echo "✅ KernelSU-Next + SuSFS ready"
-          grep -E "KSU|SUSFS" KernelSU-Next/kernel/Kconfig | head -n 20 || true
+          echo "kernel/ contents:"
+          ls -la KernelSU-Next/kernel/ | head -n 30
+
+          echo "SusFS-related Kconfig entries:"
+          grep -iE "susfs|SUSFS" KernelSU-Next/kernel/Kconfig || echo "(no susfs entries in Kconfig — expected on some forks)"
+
+          echo "SusFS-related sources inside KernelSU-Next/kernel (if any):"
+          find KernelSU-Next -iname "*susfs*" -maxdepth 4 || true
+
+          echo "✅ KernelSU-Next ready (branch: $BRANCH)"
 
       - name: Hook KernelSU into kernel build system
         working-directory: kernel_source
         run: |
           set -e
-          # أضف السطر اللي يستدعي KernelSU من الـ Makefile الرئيسي (لو ما كان موجود)
           if ! grep -q "KernelSU" Makefile; then
             echo 'obj-$(CONFIG_KSU) += KernelSU/kernel/' >> Makefile
           fi
 
-          # أضف سطر source للـ Kconfig الرئيسي (لو ما كان موجود)
           KCONFIG_MAIN=""
           for candidate in Kconfig Kconfig.ext; do
-            if [ -f "$candidate" ]; then
-              KCONFIG_MAIN="$candidate"
-              break
-            fi
+            if [ -f "$candidate" ]; then KCONFIG_MAIN="$candidate"; break; fi
           done
-          if [ -z "$KCONFIG_MAIN" ]; then
-            echo "::error::No Kconfig file found in kernel root"
-            exit 1
-          fi
+          test -n "$KCONFIG_MAIN" || { echo "::error::no Kconfig root"; exit 1; }
+
           if ! grep -q "KernelSU" "$KCONFIG_MAIN"; then
             printf '\nsource "KernelSU/kernel/Kconfig"\n' >> "$KCONFIG_MAIN"
           fi
-
-          echo "✅ KernelSU hooked into build system ($KCONFIG_MAIN)"
+          echo "✅ Hooked into $KCONFIG_MAIN"
 
       - name: Enable KernelSU + SuSFS in defconfig
         working-directory: kernel_source
         run: |
           set -e
-          # دوّر على defconfig حق A51
           DEFCONFIG=$(find arch/arm64/configs vendor -maxdepth 3 -name "*a51*defconfig" 2>/dev/null | head -n1)
           if [ -z "$DEFCONFIG" ]; then
-            # fallback: أي defconfig exynos9611
             DEFCONFIG=$(find arch/arm64/configs vendor -maxdepth 3 \( -name "*exynos9611*" -o -name "*universal9611*" \) 2>/dev/null | head -n1)
           fi
           if [ -z "$DEFCONFIG" ]; then
@@ -145,19 +134,16 @@ jobs:
           fi
           echo "Using defconfig: $DEFCONFIG"
 
-          # شيل أي خيارات قديمة (avoid duplicates)
           sed -i '/^CONFIG_KSU=/d' "$DEFCONFIG"
           sed -i '/^# CONFIG_KSU is not set/d' "$DEFCONFIG"
           sed -i '/^CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
           sed -i '/^# CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
 
-          # فعّل الخيارات المطلوبة
           {
             echo ""
-            echo "# KernelSU-Next + SuSFS"
+            echo "# KernelSU-Next"
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_SUSFS=y"
-            # SUS_SU غير مدعوم على non-GKI kernel 4.14
             echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
           } >> "$DEFCONFIG"
 
@@ -173,25 +159,22 @@ jobs:
         working-directory: kernel_source
         run: |
           set +e
-          echo "Searching for SuSFS symbols in built Image..."
-          IMG=$(find . -maxdepth 6 -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" 2>/dev/null | head -n1)
+          IMG=$(find . -maxdepth 6 \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" \) 2>/dev/null | head -n1)
           if [ -z "$IMG" ]; then
-            echo "::warning::No kernel Image found to inspect"
+            echo "::warning::No kernel Image found"
             exit 0
           fi
           echo "Inspecting: $IMG"
           if strings "$IMG" | grep -qi susfs; then
-            echo "✅ SuSFS symbols detected in kernel image"
+            echo "✅ SuSFS symbols detected"
           else
-            echo "::warning::No SuSFS strings found — SuSFS may not be active"
+            echo "::warning::No SuSFS strings — SuSFS may not be active"
           fi
 
       - name: Locate built artifacts
-        id: artifacts
         if: always()
         working-directory: kernel_source
         run: |
-          echo "Searching for outputs..."
           find . -maxdepth 6 \( -name "*.zip" -o -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" -o -name "boot.img" \) -print 2>/dev/null || true
 
       - name: Upload kernel zip(s)
