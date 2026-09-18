@@ -1,48 +1,217 @@
-name: Build A51 Kernel with KernelSU Next + SuSFS
+name: Build Kernel - Exynos 9611 (A51 / topser_cat_SN_A15)
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - topser_cat_SN_A15
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    name: build
+    runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          repository: 'mlm-studios/kernel_samsung_exynos_9611'
-          ref: 'topser_cat_SN_A15'
-          path: 'kernel_source'
+          repository: mlm-studios/kernel_samsung_exynos_9611
+          ref: topser_cat_SN_A15
+          path: kernel_source
+          fetch-depth: 1
 
-      - name: Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt -y update
-          sudo apt -y install bison flex libssl-dev python3 python-is-python3 bc
+          sudo apt -y install bison flex libssl-dev python3 python-is-python3 bc cpio rsync zip unzip git curl
 
-      - name: Download Clang
-        run: |
-          wget https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz -O "weebx-clang.tar.gz"
-          rm -rf toolchain && mkdir toolchain && tar -xvf weebx-clang.tar.gz -C toolchain && rm -rf weebx-clang.tar.gz
+      - name: Cache WeebX Clang toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: kernel_source/toolchain
+          key: weebx-clang-19.1.5-${{ runner.os }}
 
-      - name: Initialize KernelSU Next with SuSFS
+      - name: Download WeebX Clang 19.1.5
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        working-directory: kernel_source
         run: |
-          cd kernel_source
-          # تثبيت KernelSU-Non-GKI أولاً
-          curl -LSs "https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh" | bash -s
-          python3 KernelSU/scripts/integrate-no-kprobe.py --no-defconfig-flag
-          curl -LSs "https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh" | bash -s -- --cleanup
-          # محاولة تطبيق SuSFS لنواة 4.14
-          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next-susfs || echo "تخطي SuSFS"
+          set -e
+          wget -q https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz -O weebx-clang.tar.gz
+          rm -rf toolchain
+          mkdir -p toolchain
+          tar -xf weebx-clang.tar.gz -C toolchain
+          rm -f weebx-clang.tar.gz
+          echo "Toolchain contents:"
+          ls -la toolchain | head -n 20
 
-      - name: Build Kernel
+      - name: Verify toolchain is in place
+        working-directory: kernel_source
         run: |
-          cd kernel_source
+          if [ ! -d "toolchain" ]; then
+            echo "::error::toolchain directory missing inside kernel_source"
+            exit 1
+          fi
+          if [ ! -x "toolchain/bin/clang" ]; then
+            echo "::error::toolchain/bin/clang not found or not executable"
+            ls -la toolchain
+            exit 1
+          fi
+          ./toolchain/bin/clang --version
+
+      # ============================================================
+      # KernelSU-Next + SuSFS مدمج (dev-susfs fork) - لا يحتاج patches يدوية
+      # ============================================================
+      - name: Setup KernelSU-Next with SuSFS (dev-susfs)
+        working-directory: kernel_source
+        run: |
+          set -e
+          # احذف أي KernelSU قديم عشان ما يصير تعارض
+          rm -rf KernelSU KernelSU-Next
+
+          # استنسخ الفورك اللي فيه SuSFS مدمج أصلاً
+          git clone --depth=1 -b dev-susfs \
+            https://github.com/KimelaZPrjkt/KernelSU-Next-susfs.git KernelSU-Next
+
+          # SuSFS مخزّن داخل KernelSU-Next، والمجلد اللي الكيرنل يدوّر عليه اسمه KernelSU
+          ln -sf KernelSU-Next KernelSU
+
+          # اربطه بالـ Makefile و Kconfig
+          KSU_MAKEFILE="KernelSU-Next/kernel/Makefile"
+          KSU_KCONFIG="KernelSU-Next/kernel/Kconfig"
+          if [ ! -f "$KSU_MAKEFILE" ]; then
+            echo "::error::KernelSU-Next kernel/Makefile not found — wrong branch?"
+            ls -la KernelSU-Next
+            exit 1
+          fi
+
+          # تأكد إن الملفات الرئيسية لـ SuSFS موجودة
+          test -f KernelSU-Next/kernel/susfs.c || {
+            echo "::error::susfs.c not found — dev-susfs branch missing SuSFS?"
+            exit 1
+          }
+          test -f KernelSU-Next/kernel/susfs.h || {
+            echo "::error::susfs.h not found"
+            exit 1
+          }
+
+          echo "✅ KernelSU-Next + SuSFS ready"
+          grep -E "KSU|SUSFS" KernelSU-Next/kernel/Kconfig | head -n 20 || true
+
+      - name: Hook KernelSU into kernel build system
+        working-directory: kernel_source
+        run: |
+          set -e
+          # أضف السطر اللي يستدعي KernelSU من الـ Makefile الرئيسي (لو ما كان موجود)
+          if ! grep -q "KernelSU" Makefile; then
+            echo 'obj-$(CONFIG_KSU) += KernelSU/kernel/' >> Makefile
+          fi
+
+          # أضف سطر source للـ Kconfig الرئيسي (لو ما كان موجود)
+          KCONFIG_MAIN=""
+          for candidate in Kconfig Kconfig.ext; do
+            if [ -f "$candidate" ]; then
+              KCONFIG_MAIN="$candidate"
+              break
+            fi
+          done
+          if [ -z "$KCONFIG_MAIN" ]; then
+            echo "::error::No Kconfig file found in kernel root"
+            exit 1
+          fi
+          if ! grep -q "KernelSU" "$KCONFIG_MAIN"; then
+            printf '\nsource "KernelSU/kernel/Kconfig"\n' >> "$KCONFIG_MAIN"
+          fi
+
+          echo "✅ KernelSU hooked into build system ($KCONFIG_MAIN)"
+
+      - name: Enable KernelSU + SuSFS in defconfig
+        working-directory: kernel_source
+        run: |
+          set -e
+          # دوّر على defconfig حق A51
+          DEFCONFIG=$(find arch/arm64/configs vendor -maxdepth 3 -name "*a51*defconfig" 2>/dev/null | head -n1)
+          if [ -z "$DEFCONFIG" ]; then
+            # fallback: أي defconfig exynos9611
+            DEFCONFIG=$(find arch/arm64/configs vendor -maxdepth 3 \( -name "*exynos9611*" -o -name "*universal9611*" \) 2>/dev/null | head -n1)
+          fi
+          if [ -z "$DEFCONFIG" ]; then
+            echo "::error::Could not locate A51/Exynos9611 defconfig"
+            find arch/arm64/configs -name "*defconfig" | head -n 20
+            exit 1
+          fi
+          echo "Using defconfig: $DEFCONFIG"
+
+          # شيل أي خيارات قديمة (avoid duplicates)
+          sed -i '/^CONFIG_KSU=/d' "$DEFCONFIG"
+          sed -i '/^# CONFIG_KSU is not set/d' "$DEFCONFIG"
+          sed -i '/^CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
+          sed -i '/^# CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
+
+          # فعّل الخيارات المطلوبة
+          {
+            echo ""
+            echo "# KernelSU-Next + SuSFS"
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            # SUS_SU غير مدعوم على non-GKI kernel 4.14
+            echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
+          } >> "$DEFCONFIG"
+
+          echo "✅ defconfig updated"
+
+      - name: Build kernel (target=a51)
+        working-directory: kernel_source
+        run: |
           python3 build_kernel.py --target=a51 --allow-dirty
 
-      - name: Upload kernel
+      - name: Verify SuSFS symbols in output
+        if: success()
+        working-directory: kernel_source
+        run: |
+          set +e
+          echo "Searching for SuSFS symbols in built Image..."
+          IMG=$(find . -maxdepth 6 -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" 2>/dev/null | head -n1)
+          if [ -z "$IMG" ]; then
+            echo "::warning::No kernel Image found to inspect"
+            exit 0
+          fi
+          echo "Inspecting: $IMG"
+          if strings "$IMG" | grep -qi susfs; then
+            echo "✅ SuSFS symbols detected in kernel image"
+          else
+            echo "::warning::No SuSFS strings found — SuSFS may not be active"
+          fi
+
+      - name: Locate built artifacts
+        id: artifacts
+        if: always()
+        working-directory: kernel_source
+        run: |
+          echo "Searching for outputs..."
+          find . -maxdepth 6 \( -name "*.zip" -o -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" -o -name "boot.img" \) -print 2>/dev/null || true
+
+      - name: Upload kernel zip(s)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ github.run_number }}
-          path: kernel_source/*.zip
+          name: kernel-a51-${{ github.run_number }}
+          path: |
+            kernel_source/*.zip
+            kernel_source/out/**/*.zip
+            kernel_source/AnyKernel3/*.zip
+            kernel_source/arch/arm64/boot/Image*
+          if-no-files-found: warn
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            kernel_source/*.log
+            kernel_source/out/**/*.log
+          if-no-files-found: ignore
