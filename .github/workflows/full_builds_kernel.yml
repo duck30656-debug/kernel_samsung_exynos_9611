@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       max-parallel: 4   
       matrix:
-        device: [a51,f41,m31s,m31,m21,gta4xl,gta4xlwifi]
+        device: [a51]
         variant: ['', --oneui]
         ksu: ['', --no-ksu]
 
