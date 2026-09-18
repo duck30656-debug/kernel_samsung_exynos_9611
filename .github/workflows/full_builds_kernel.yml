@@ -1,137 +1,218 @@
-name: Build Kernel Zips (with/out releases)
+name: Build Kernel - Exynos 9611 (A51 / topser_cat_SN_A15)
 
 on:
-  push:
-    branches: '**'
-  pull_request:
-    branches: '**'
   workflow_dispatch:
-    inputs:
-      tag_name:
-        description: 'Tag Name'
-        required: true
-        default: '1.8.0'
-      upload_releases:
-        description: 'Upload releases'
-        required: true
-        default: 'true'
-        type: boolean
-      mark_prerelease:
-        description: 'Mark as prerelease'
-        required: true
-        default: 'false'
-        type: boolean
+  push:
+    branches:
+      - topser_cat_SN_A15
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        device: [a51]
-        variant: ['', --oneui]
-        ksu: ['', --no-ksu]
+    name: build
+    runs-on: ubuntu-24.04
 
-    name: "Build ${{ matrix.device }} ${{ matrix.variant }} ${{ matrix.ksu }}"
     steps:
-      - name: Checkout source
+      - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          repository: mlm-studios/kernel_samsung_exynos_9611
+          ref: topser_cat_SN_A15
+          path: kernel_source
+          fetch-depth: 1
 
-      - name: apt update
+      - name: Install build dependencies
         run: |
           sudo apt -y update
-          sudo apt -y install bison flex libssl-dev python3 python-is-python3
+          sudo apt -y install bison flex libssl-dev python3 python-is-python3 bc cpio rsync zip unzip git curl
 
-      - name: Download clang
-        run: |
-          wget https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz -O "weebx-clang.tar.gz"
-          rm -rf toolchain && mkdir toolchain && tar -xvf weebx-clang.tar.gz -C toolchain && rm -rf weebx-clang.tar.gz
+      - name: Cache WeebX Clang toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: kernel_source/toolchain
+          key: weebx-clang-19.1.5-${{ runner.os }}
 
-      - name: Initialize KernelSU
-        if: matrix.ksu != '--no-ksu'
-        shell: bash
+      - name: Download WeebX Clang 19.1.5
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        working-directory: kernel_source
         run: |
-          set -euo pipefail
-          curl -LSsf \
-            https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh \
-            | bash -s
-          python3 KernelSU/scripts/integrate-no-kprobe.py --no-defconfig-flag
-          curl -LSsf \
-            https://raw.githubusercontent.com/mlm-games/KernelSU-Non-GKI/main/kernel/setup-subm.sh \
-            | bash -s -- --cleanup
+          set -e
+          wget -q https://github.com/XSans0/WeebX-Clang/releases/download/WeebX-Clang-19.1.5-release/WeebX-Clang-19.1.5.tar.gz -O weebx-clang.tar.gz
+          rm -rf toolchain
+          mkdir -p toolchain
+          tar -xf weebx-clang.tar.gz -C toolchain
+          rm -f weebx-clang.tar.gz
+          ls -la toolchain | head -n 20
 
-      - name: Clean generated integration state
+      - name: Verify toolchain is in place
+        working-directory: kernel_source
         run: |
-          git reset --hard HEAD
-          git clean -ffdx
+          test -d "toolchain" || { echo "::error::toolchain missing"; exit 1; }
+          test -x "toolchain/bin/clang" || { echo "::error::clang missing"; exit 1; }
+          ./toolchain/bin/clang --version
 
-      - name: Build Kernel
-        id: build_kernel
-        continue-on-error: true
+      # ============================================================
+      # KernelSU-Next + SuSFS (dev-susfs fork)
+      # - التثبيت الأساسي: KernelSU-Next
+      # - ملفات SuSFS تجي إما داخلة مع الفرع، أو تنطبق كـ patches
+      #   على الكيرنل لاحقاً. هنا نجهّز البنية الأساسية فقط.
+      # ============================================================
+      - name: Setup KernelSU-Next (dev-susfs)
+        working-directory: kernel_source
         run: |
-          set -o pipefail
-          mkdir -p build_logs
-          for attempt in 1 2 3; do
-            echo "=== Attempt $attempt ===" | tee -a build_logs/build_attempt.log
-            python3 build_kernel.py ${{ matrix.variant }} --target=${{ matrix.device }} ${{ matrix.ksu }} 2>&1 | tee -a build_logs/build_attempt.log
-            exit_code=${PIPESTATUS[0]}
-            if [ $exit_code -eq 0 ]; then
-              echo "Build succeeded on attempt $attempt" | tee -a build_logs/build_attempt.log
-              exit 0
+          set -e
+          rm -rf KernelSU KernelSU-Next
+
+          BRANCH=""
+          for candidate in dev-susfs next-susfs; do
+            echo "::group::Trying branch: $candidate"
+            if git clone --depth=1 -b "$candidate" \
+                 https://github.com/KimelaZPrjkt/KernelSU-Next-susfs.git KernelSU-Next 2>&1; then
+              if [ -f "KernelSU-Next/kernel/Makefile" ] && [ -f "KernelSU-Next/kernel/Kconfig" ]; then
+                BRANCH="$candidate"
+                echo "✅ Branch $candidate is usable"
+                echo "::endgroup::"
+                break
+              else
+                echo "::warning::Branch $candidate cloned but missing kernel/Makefile or Kconfig"
+              fi
             fi
-            echo "Attempt $attempt failed with exit code $exit_code" | tee -a build_logs/build_attempt.log
-            sleep 10
+            rm -rf KernelSU-Next
+            echo "::endgroup::"
           done
-          exit 1
 
-      - name: Collect all logs
-        if: always()
+          if [ -z "$BRANCH" ]; then
+            echo "::error::No usable branch found (tried dev-susfs, next-susfs)"
+            exit 1
+          fi
+          echo "==> Using branch: $BRANCH"
+
+          ln -sf KernelSU-Next KernelSU
+
+          echo "===== Diagnostic: KernelSU-Next root ====="
+          ls -la KernelSU-Next | head -n 30
+
+          echo "===== Diagnostic: KernelSU-Next/kernel ====="
+          ls -la KernelSU-Next/kernel | head -n 40
+
+          echo "===== Diagnostic: any susfs file anywhere in KernelSU-Next ====="
+          find KernelSU-Next -iname "*susfs*" 2>/dev/null || echo "(no susfs files inside KernelSU-Next)"
+
+          echo "===== Diagnostic: SusFS entries in kernel/Kconfig (if any) ====="
+          grep -iE "susfs|SUSFS" KernelSU-Next/kernel/Kconfig || echo "(no susfs Kconfig entries — normal for some forks)"
+
+          echo "✅ KernelSU-Next ready (branch: $BRANCH)"
+
+      - name: Hook KernelSU into kernel build system
+        working-directory: kernel_source
         run: |
-          mkdir -p all_logs
-          find . -type f \( -name '*.log' -o -name '*err*' -o -name '*out*' \) -not -path './.git/*' -exec cp --parents {} all_logs/ \; 2>/dev/null || true
-          cp -r build_logs all_logs/ 2>/dev/null || true
-          echo "=== Collected log files ==="
-          find all_logs -type f | head -50
+          set -e
 
-      - name: Print Logs
-        if: always()
+          if ! grep -q "KernelSU" Makefile; then
+            echo 'obj-$(CONFIG_KSU) += KernelSU/kernel/' >> Makefile
+          fi
+
+          KCONFIG_MAIN=""
+          for candidate in Kconfig Kconfig.ext; do
+            if [ -f "$candidate" ]; then KCONFIG_MAIN="$candidate"; break; fi
+          done
+          test -n "$KCONFIG_MAIN" || { echo "::error::no root Kconfig"; exit 1; }
+
+          if ! grep -q "KernelSU" "$KCONFIG_MAIN"; then
+            printf '\nsource "KernelSU/kernel/Kconfig"\n' >> "$KCONFIG_MAIN"
+          fi
+          echo "✅ Hooked into $KCONFIG_MAIN"
+
+      - name: Enable KernelSU + SuSFS in defconfig
+        working-directory: kernel_source
         run: |
-          echo "=== Build attempt log ==="
-          cat build_logs/build_attempt.log 2>/dev/null || echo "No build attempt log found"
-          echo ""
-          echo "=== Error logs ==="
-          find . -type f -name '*err.log' -exec sh -c 'echo "--- {} ---"; cat "{}"' \; 2>/dev/null || echo "No err.log files"
-          echo ""
-          echo "=== Out logs ==="
-          find . -type f -name '*out.log' -exec sh -c 'echo "--- {} ---"; cat "{}"' \; 2>/dev/null || echo "No out.log files"
+          set -e
 
-      - name: Upload build logs as artifact
+          DEFCONFIG=""
+          for pattern in "*a51*defconfig" "*exynos9611*defconfig" "*universal9611*defconfig"; do
+            DEFCONFIG=$(find arch/arm64/configs vendor -maxdepth 3 -name "$pattern" 2>/dev/null | head -n1)
+            [ -n "$DEFCONFIG" ] && break
+          done
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "::error::Could not locate A51/Exynos9611 defconfig"
+            echo "Available defconfigs:"
+            find arch/arm64/configs -name "*defconfig" | head -n 20
+            exit 1
+          fi
+          echo "Using defconfig: $DEFCONFIG"
+
+          sed -i '/^CONFIG_KSU=/d' "$DEFCONFIG"
+          sed -i '/^# CONFIG_KSU is not set/d' "$DEFCONFIG"
+          sed -i '/^CONFIG_KSU_SUSFS=/d' "$DEFCONFIG"
+          sed -i '/^# CONFIG_KSU_SUSFS is not set/d' "$DEFCONFIG"
+          sed -i '/^CONFIG_KSU_SUSFS_SUS_SU/d' "$DEFCONFIG"
+          sed -i '/^# CONFIG_KSU_SUSFS_SUS_SU/d' "$DEFCONFIG"
+
+          {
+            echo ""
+            echo "# KernelSU-Next configuration"
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
+          } >> "$DEFCONFIG"
+
+          echo "✅ defconfig updated: $DEFCONFIG"
+
+      - name: Build kernel (target=a51)
+        working-directory: kernel_source
+        run: |
+          python3 build_kernel.py --target=a51 --allow-dirty
+
+      - name: Verify KernelSU + SuSFS symbols in output
+        if: success()
+        working-directory: kernel_source
+        run: |
+          set +e
+          IMG=$(find . -maxdepth 6 \( -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" \) 2>/dev/null | head -n1)
+          if [ -z "$IMG" ]; then
+            echo "::warning::No kernel Image found to inspect"
+            exit 0
+          fi
+          echo "Inspecting: $IMG"
+          if strings "$IMG" | grep -qi "susfs"; then
+            echo "✅ SuSFS symbols detected in kernel image"
+          else
+            echo "::warning::No SuSFS strings found — SuSFS may not be fully active"
+          fi
+          if strings "$IMG" | grep -qi "kernelsu\|ksu"; then
+            echo "✅ KernelSU symbols detected"
+          else
+            echo "::warning::No KernelSU strings found"
+          fi
+
+      - name: Locate built artifacts
+        if: always()
+        working-directory: kernel_source
+        run: |
+          find . -maxdepth 6 \( -name "*.zip" -o -name "Image" -o -name "Image.gz" -o -name "Image.gz-dtb" -o -name "boot.img" \) -print 2>/dev/null || true
+
+      - name: Upload kernel zip(s)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-${{ matrix.device }}-${{ matrix.variant }}-${{ matrix.ksu }}
+          name: kernel-a51-${{ github.run_number }}
           path: |
-            all_logs/
-            build_logs/
-          retention-days: 30
+            kernel_source/*.zip
+            kernel_source/out/**/*.zip
+            kernel_source/AnyKernel3/*.zip
+            kernel_source/arch/arm64/boot/Image*
+          if-no-files-found: warn
 
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v2
-        if: inputs.upload_releases == true && steps.build_kernel.outcome == 'success'
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          files: |
-            *SN*.zip
-          name: SN (with/without susfs+KernelSU Next) Flashable zips // ${{ inputs.tag_name }}
-          tag_name: ${{ inputs.tag_name }}
-          body: |
-            Flash using a custom recovery or Kernel Flasher from Fdroid (Gplay apps are not trustworthy for flashing)
-            Open an issue with the rom and device used when it doesn't boot and you're sure it's due to the kernel.
-            All are KSU zips.
-            
-            AOSP and OneUI variants are provided for each device.
-          prerelease: ${{ inputs.mark_prerelease }}
+          name: build-log-${{ github.run_number }}
+          path: |
+            kernel_source/*.log
+            kernel_source/out/**/*.log
+          if-no-files-found: ignore
